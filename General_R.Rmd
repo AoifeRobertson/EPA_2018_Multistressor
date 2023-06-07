@@ -1,0 +1,409 @@
+---
+title: "
+EPA_2018_Multistressor - General Code"
+output: html_notebook
+---
+*Note*: For the purpose of this general code, the response variable is 
+referred to as `Var1`.
+
+Load packages that are needed
+```{r}
+library("randomForest")
+library("ggRandomForests")
+library("corrplot")
+library("usdm") #vif
+library("Hmisc") #histograms
+require("nlme")
+library("mgcv")
+library("MuMIn")
+```
+
+Import the data
+```{r}
+#Import and rename data
+#NOTE: Ensure no % signs in data as this will result in altered names
+Data <- read.csv("DATA.csv",
+                 header = TRUE,
+                 stringsAsFactors = FALSE,
+                 sep = ",", dec = ".")
+
+#See structure of data
+raw.data <- Data
+View(Data)
+```
+
+Remove unnecessary columns from the data
+```{r}
+#Removing columns on either end of the data with information that is not useful
+Data <-Data[,10:114]
+
+##Remove count columns as they are not informative of relationships
+Data$variable_count <- NULL
+
+#Repeat for all unnecessary response variables
+Data$response_variable <- NULL
+
+#Remove variables with >50% NAs
+Data$variable_name <- NULL
+
+#View Data structure
+str(Data)
+```
+
+**Phytobenthic data only**
+Remove DO from data as it is often a product of algal activity rather than a 
+driver.
+```{r}
+Data$DO <- NULL
+
+str(Data)
+```
+
+Run random forest analysis
+```{r}
+#Set the seed count. This allows for reproducible analysis
+set.seed(1234) 
+
+#Fit RF model
+rfdata <- randomForest(Data$Var1~., data=Data,
+                       na.action = na.roughfix, ntree=1500)
+
+print(rfdata)
+plot(gg_error(rfdata))
+```
+
+Rank the variables by importance
+```{r}
+#Plot the top ranking variables after which there is a notable drop in MDG
+varImpPlot(rfdata, n.var = 30, main = "Stressor Hierarchy", bg = "skyblue", 
+           pch=21, cex=0.7)
+
+#List variables with corresponding MDG
+randomForest::importance(rfdata)
+```
+
+Reduce data by removing variables that are deemed unimportant.
+```{r}
+#Elimate unimportant variables (those not included in the top ranking graph)
+Data$response_variable <- NULL
+
+#Remove measures of central tendency for which there is a higher-ranking measure
+# of central tendency available for the same variable. 
+Data$variable_mean <- NULL
+
+str(Data) 
+```
+
+Box-cox transform (code by Leoni Mack)
+```{r}
+library(car) #for the powerTransform function
+
+# Set some important functions for transformation (from Leoni Mack <- Dan):
+estimateBC = function(x){ 
+  # function to estimate transformation parameters for continuous variable x require(car) 
+  gamma = min(x, na.rm=T) - 0.001 # offset (min value minus a small number) 
+  x = x - gamma # subtract gamma from x, so that it is strictly positive 
+  lambda = powerTransform(x~1, family="bcPower")$lambda # estimate lambda of Box-Cox transformation... 
+  xT = bcPower(x, lambda=lambda) # apply box-cox transform 
+  xT.mean = mean(xT) # mean of transformed values, for centering 
+  xT.sd = sd(xT) # sd of transformed values, for scaling 
+  # return the transformation parameters 
+  return(c(gamma=gamma, lambda=lambda, xT.mean=xT.mean, xT.sd=xT.sd)) 
+}
+applyBC = function(x, P=estimateBC(x)){ 
+  # function to transform continuous variable x using transformation parameters P 
+  require(car)
+  gamma = P[1] 
+  lambda = P[2] 
+  xT.mean = P[3] 
+  xT.sd = P[4] 
+  xT = bcPower(x-gamma, lambda) # apply box-cox transform 
+  #xT = (xT-xT.mean)/xT.sd # centre and scale - disabled as it is not needed in this case
+  return(xT) 
+}
+backBC = function(xT, P){ 
+  # function to back transform transformed variable xT using transformation parameters P 
+  gamma=P[1] 
+  lambda=P[2] 
+  xT.mean=P[3] 
+  xT.sd=P[4]
+  xT.unscaled = xT*xT.sd + xT.mean #shouldn't be used if variables are not standardised
+  x.original = exp(log(lambda*xT.unscaled + 1)/lambda) + gamma 
+  return(x.original) 
+}
+
+#Transform
+#Repeat for all explanatory variables
+P.variable = estimateBC(Data$variable)
+variableBC = applyBC(Data$variable, P.variable)
+P.variable #to obtain the scaling parameters
+
+#Check histograms for an approximation of a bell-shaped curve
+par(mfrow=c(2,4))
+
+hist(Data$variable)
+
+hist(variableBC)
+
+#Shapiro-Wilk's test of normality; P should be >0.05, but this may be difficult to achieve
+shapiro.test(variableBC)
+```
+
+Create a new dataset of transformed variables
+```{r}
+t.Data <- Data
+
+#Repeat for all variables
+t.Data$variable <- variableBC
+
+str(t.Data)
+```
+
+Look to see if there are any correlations between variables. 
+```{r}
+#Make an object containing all correlations so that they can be plotted.
+corr <- cor(t.Data, use = "complete.obs" )
+
+#Visualize the correlations so it can be included in results
+corrplot(corr, #The correlation matrix to visualize
+         method=c("circle"), # the visualization method
+         type = "lower" , #display lower triangular
+         diag = FALSE,#whether display the correlation coefficients
+         order = "hclust", #for the hierarchical clustering order
+         hclust.method = "average", #agglomeration method
+         tl.pos = "ld", #position of text labels left and diagonal
+         tl.cex=0.5, #size of text label
+         tl.col = "black", #colour of text label
+         cl.pos = "b", #position of colour legend 
+         cl.length = 11, #number of number text in colour legend
+         cl.cex=0.5,
+         win.asp = 0.67 #Aspect ration for the whole plot
+         )
+```
+
+Some pairs have a Pearson's correlation coefficiant indicating that they
+are significantly correlated (\>0.8 or \<-0.8). These need to be
+identified.
+```{r}
+cor(t.Data, use = "complete.obs") > 0.8
+cor(t.Data, use = "complete.obs") < -0.8
+```
+
+For each pair that is significantly correlated, we remove the variable
+with the lower MDG.
+```{r}
+#Remove based on correlations
+t.Data$variable <- NULL
+
+str(t.Data)
+cor(t.Data, use = "complete.obs")   #Double check
+```
+
+We might have missed some correlations that the previous code was not
+looking for. We make sure this hasn't happened by examining the data
+visually. Any suspicious looking pairs are looked at more closely and
+then dealt with if they are deemed correlated. We deal with them the
+same way we did with the cor() plot: by removing the variable with the
+lower MDG.
+```{r}
+#Look for correlations
+pairs(t.Data)
+
+pairs.data <- t.Data
+
+#Remove suspicious variables from data set
+pairs.data$variable <- NULL
+
+pairs(pairs.data)
+
+t.Data <- pairs.data
+```
+
+We need to add random terms back in so that we can account for temporal
+variability
+```{r}
+#Adding random terms
+t.Data$Temporal <- as.factor(raw.data$temporal_variable)
+t.Data$Spatial <- as.factor(raw.data$spatial_variable)
+
+t.Data$Longitude <- raw.data$Longitude
+t.Data$Latitude <- raw.data$Latitude
+
+str(t.Data) 
+```
+
+There are many functions that will not work if the data contains NAs.
+Because of this, we remove NAs from the data set. If a row has even one
+NA the entire row is removed.
+```{r}
+#Removing NAs
+str(t.Data)
+sum(is.na(t.Data))
+colSums(is.na(t.Data))
+t.Data.clean <- t.Data
+t.Data.clean <- na.omit(t.Data)
+str(t.Data.clean)
+sum(is.na(t.Data.clean))
+t.Data<-t.Data.clean
+rm(t.Data.clean)
+str(t.Data)
+```
+
+We need to check that there are no outliers affecting the data.
+```{r}
+#Removing outliers
+boxplot(t.Data)
+```
+
+Create a dataset specifically for the model
+```{r}
+m.Data <- t.Data
+
+str(m.Data)
+
+#Give each variable a short name
+Response <- m.Data$Var1
+ExVar1 <- m.Data$explanatory_variable_1
+ExVar2 <- m.Data$explanatory_variable_2
+Year <- m.Data$Year
+Catchment <- m.Data$Catchment
+Latitude <- m.Data$Latitude
+Longitude <- m.Data$Longitude
+
+```
+
+Create the global model
+```{r}
+GAM <- gam(data=m.Data, Response ~ 
+             s(ExVar1, k=3)
+           + s(ExVar2, k=3)
+           + s(Catchment, bs="re", k=3)
+           + s(Latitude, Longitude, bs="sos")
+           + s(Year, bs="re", k=3),
+           family = "gaussian")
+
+summary(GAM) #For this example ExVar2 returns an EDF=1
+AIC(GAM)
+```
+
+Remove smoother terms EDF=1
+```{r}
+GAM1 <- gam(data=m.Data, Response ~ 
+             s(ExVar1, k=3)
+           + ExVar2
+           + s(Catchment, bs="re", k=3)
+           + s(Latitude, Longitude, bs="sos")
+           + s(Year, bs="re", k=3),
+           family = "gaussian")
+
+summary(GAM1)
+AIC(GAM1)
+AIC(GAM)-AIC(GAM1) 
+```
+
+Remove smoother terms EDF~1 until an AIC change >2 occurs
+
+Identify the best fit model (without interactions) using dredge
+```{r}
+dredge(GAM2, options(na.action ="na.fail"),rank = "AIC" )
+```
+
+Write out the GAM identified by dredge.
+```{r}
+GAM.no.int <- gam(data=m.Data, Response ~ 
+             s(ExVar1, k=3)
+           + ExVar2
+           + s(Catchment, bs="re", k=3)
+           + s(Latitude, Longitude, bs="sos")
+           + s(Year, bs="re", k=3),
+           family = "gaussian")
+
+AIC(GAM.no.int)
+summary(GAM.no.int)
+
+```
+
+Add in all posible interactions.
+Linear/linear interactions are written as `l.var * l.var`
+Linear/nonlinear interactions are written as `s(nl.int, k=3, by=l.var)`
+Nonlinear/nonlinear interactions are written as `te(nl.var, nl.var)`
+```{r}
+#linear/linear interactions are written as 
+GAM.int <- gam(data=m.Data, Response ~ 
+             s(ExVar1, k=3, by=ExVar2)
+           + s(Catchment, bs="re", k=3)
+           + s(Latitude, Longitude, bs="sos")
+           + s(Year, bs="re", k=3),
+           family = "gaussian")
+  
+summary(GAM.int)
+```
+
+If there are many interactions then you may have to manually remove some before
+putting the model into dredge. If this is the case, remove the variable or 
+interactions with the highest p-value. Repeat until the model can be dredged.
+
+```{r}
+dredge(GAM.int, options(na.action ="na.fail"),rank = "AIC" )
+```
+
+Write out the best model as identified using dredge
+```{r}
+GAM.best <- gam(data=m.Data, Response ~ 
+             s(ExVar1, k=3, by=ExVar2)
+           + s(Catchment, bs="re", k=3)
+           + s(Latitude, Longitude, bs="sos")
+           + s(Year, bs="re", k=3),
+           family = "gaussian")
+
+summary(best.Int)
+AIC(best.Int) 
+```
+
+Check for spatial autocorrelation
+```{r}
+#1. Calculate the distances between each pair of sites, using their decimal
+#longitudes and latitudes:
+library(sp)
+d = spDists(cbind(Latitude,Longitude), longlat=T)
+
+#2. Convert the distance matrix into inverse weights:
+w = 1/d
+diag(w) = 0
+w[is.infinite(w)] <- 0 
+
+#3. Perform Moran’s test on the residuals (r):
+r = residuals(best.Int, type="response")
+library(ape)
+Moran.I(x=r, weight=w)
+
+#From Leoni: we suggest substantive problems will be indicated by Moran’s I > 0.1
+```
+
+Plot relationships
+```{r}
+sjPlot::plot_model(GAM.best , type = "pred", terms = "ExVar1"
+           , axis.title = rbind("ExVar1 (λ = P.variable)", "Response")
+           , title = "P = "
+           , show.data = TRUE)
+```
+
+Plot raw data
+```{r}
+library("tidyverse")
+
+ggplot(data = raw.data, aes(x = ExVar1, y = response)) +
+  geom_point(size = 2) +
+  geom_smooth(method=lm) +
+  labs(x = "ExVar1", y = "TDI3", title = "response") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Plot interactions
+```{r}
+require(car)
+
+coplot(response ~
+       (ExVar1)|(ExVar2), row =1, col = "#C03830", panel=panel.car, number=3, 
+       xlab = c("ExVar1", paste("Given:", "ExVar2")))
+```
