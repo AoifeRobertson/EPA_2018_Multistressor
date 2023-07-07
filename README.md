@@ -1,4 +1,4 @@
-# An examination of nonlinearities and interactions of biological responses to multiple stressors. 
+# IMPROVING MULTIPLE STRESSOR-RESPONSE MODELS THROUGH THE INCLUSION OF NONLINEARITY AND INTERACTIONS
 
 ## Background
 
